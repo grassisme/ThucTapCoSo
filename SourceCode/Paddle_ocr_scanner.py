@@ -1,9 +1,3 @@
-"""
-PaddleOCR Scanner - Scan nội dung từ nhiều loại file
-Hỗ trợ: PNG, JPG, JPEG, BMP, TIFF, PDF, DOCX, XLSX, PPTX
-Tương thích: PaddleOCR v2 và v3+
-"""
-
 import os
 import sys
 import json
