@@ -1,17 +1,26 @@
 import os
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 
-from Paddle_ocr_scanner import PaddleOCRScanner
+from summarizer import summarize_file
 
-scanner = PaddleOCRScanner(lang="vi")
+    # ── Cấu hình ──────────────────────────────────────────
+FILE_PATH     = r"G:\hoc code\TTCS\ThucTapCoSo\SourceCode\Screenshot 2026-03-20 200850.png"
+GEMINI_KEY    = ""
+NUM_SENTENCES = 3
+    # ──────────────────────────────────────────────────────
 
-result = scanner._run_ocr(r"G:\hoc code\TTCS\test_page1.png")
-print("TYPE:", type(result))
-print("LEN:", len(result) if result else 0)
+if not os.path.exists(FILE_PATH):
+        print(f"[!] Không tìm thấy file: {FILE_PATH}")
+else:
+        result = summarize_file(
+            FILE_PATH,
+            api_key=GEMINI_KEY,
+            lang_ocr="en",
+            num_sentences=NUM_SENTENCES,
+            language="English",
+        )
 
-for i, item in enumerate(result or []):
-    print(f"\n--- item {i} ---")
-    print("type item:", type(item))
-    if isinstance(item, dict):
-        print("keys:", list(item.keys()))
-        print("rec_texts:", item.get("rec_texts"))
+        print("\n" + "="*60)
+        print("TEXTTEASER")
+        print("="*60)
+        print(result["textteaser"] or "(trống)")
