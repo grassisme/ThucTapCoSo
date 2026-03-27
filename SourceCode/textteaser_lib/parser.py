@@ -23,7 +23,6 @@ class Parser:
     def getSentenceLengthScore(self, sentence):
         return (self.ideal - abs(self.ideal - len(sentence))) / self.ideal
 
-    # Jagadeesh, J., Pingali, P., & Varma, V. (2005). Sentence Extraction Based Single Document Summarization. International Institute of Information Technology, Hyderabad, India, 5.
     def getSentencePositionScore(self, i, sentenceCount):
         normalized = i / (sentenceCount * 1.0)
 

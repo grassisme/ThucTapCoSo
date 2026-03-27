@@ -21,6 +21,42 @@ else:
         )
 
         print("\n" + "="*60)
+        print("KEYBERT - TỪ KHOÁ")
+        print("="*60)
+        print(result["keywords"] or "(trống)")
+
+        print("\n" + "="*60)
+        print("TOPIC SENTENCES")
+        print("="*60)
+        print(result["topics"] or "(trống)")
+
+        print("\n" + "="*60)
+        print("LSA + KeyBERT Rerank")
+        print("="*60)
+        print(result["lsa"] or "(trống)")
+
+        print("\n" + "="*60)
+        print("TextRank + KeyBERT Rerank")
+        print("="*60)
+        print(result["textrank"] or "(trống)")
+
+        print("\n" + "="*60)
+        print("KeyBERT Thuần")
+        print("="*60)
+        print(result["keybert"] or "(trống)")
+
+        print("\n" + "="*60)
         print("TEXTTEASER")
         print("="*60)
         print(result["textteaser"] or "(trống)")
+
+        print("\n" + "="*60)
+        print("VOTING (LSA + TextRank + TextTeaser + KeyBERT) - TỐT NHẤT")
+        print("="*60)
+        print(result["voting"] or "(trống)")
+
+        if result["abstractive"]:
+            print("\n" + "="*60)
+            print("GEMINI AI (Abstractive)")
+            print("="*60)
+            print(result["abstractive"])
