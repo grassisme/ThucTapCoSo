@@ -1,0 +1,231 @@
+import sqlite3
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+ 
+ 
+DB_PATH = os.path.join(os.path.dirname(__file__), "flashcards.db")
+ 
+ 
+# ─── Khởi tạo database ────────────────────────────────────────────────────────
+ 
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+ 
+    # Bảng deck (bộ thẻ)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS decks (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            color       TEXT DEFAULT '#7c6af7',
+            created_at  TEXT DEFAULT (datetime('now')),
+            updated_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+ 
+    # Bảng flashcard
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS flashcards (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            deck_id      INTEGER NOT NULL,
+            front        TEXT NOT NULL,
+            back         TEXT NOT NULL,
+            source_file  TEXT DEFAULT '',
+            tags         TEXT DEFAULT '',
+            difficulty   INTEGER DEFAULT 0,
+            review_count INTEGER DEFAULT 0,
+            correct      INTEGER DEFAULT 0,
+            next_review  TEXT DEFAULT (datetime('now')),
+            created_at   TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (deck_id) REFERENCES decks(id) ON DELETE CASCADE
+        )
+    """)
+ 
+    conn.commit()
+    conn.close()
+ 
+ 
+# ─── CRUD Deck ─────────────────────────────────────────────────────────────────
+ 
+def create_deck(name: str, description: str = "", color: str = "#7c6af7") -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO decks (name, description, color) VALUES (?,?,?)",
+              (name, description, color))
+    deck_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return deck_id
+ 
+ 
+def get_decks() -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT d.*, COUNT(f.id) as card_count,
+               SUM(CASE WHEN f.next_review <= datetime('now') THEN 1 ELSE 0 END) as due_count
+        FROM decks d
+        LEFT JOIN flashcards f ON f.deck_id = d.id
+        GROUP BY d.id
+        ORDER BY d.updated_at DESC
+    """)
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+ 
+ 
+def update_deck(deck_id: int, name: str, description: str = "", color: str = "#7c6af7"):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE decks SET name=?, description=?, color=?, updated_at=datetime('now') WHERE id=?",
+              (name, description, color, deck_id))
+    conn.commit()
+    conn.close()
+ 
+ 
+def delete_deck(deck_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM decks WHERE id=?", (deck_id,))
+    conn.commit()
+    conn.close()
+ 
+ 
+# ─── CRUD Flashcard ────────────────────────────────────────────────────────────
+ 
+def add_card(deck_id: int, front: str, back: str,
+             source_file: str = "", tags: str = "") -> int:
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO flashcards (deck_id, front, back, source_file, tags)
+        VALUES (?,?,?,?,?)
+    """, (deck_id, front.strip(), back.strip(), source_file, tags))
+    card_id = c.lastrowid
+    c.execute("UPDATE decks SET updated_at=datetime('now') WHERE id=?", (deck_id,))
+    conn.commit()
+    conn.close()
+    return card_id
+ 
+ 
+def get_cards(deck_id: int) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM flashcards WHERE deck_id=? ORDER BY created_at DESC",
+              (deck_id,))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+ 
+ 
+def get_due_cards(deck_id: int) -> list[dict]:
+    """Lấy các thẻ cần ôn hôm nay."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT * FROM flashcards
+        WHERE deck_id=? AND next_review <= datetime('now')
+        ORDER BY next_review ASC
+    """, (deck_id,))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+ 
+ 
+def update_card(card_id: int, front: str, back: str, tags: str = ""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE flashcards SET front=?, back=?, tags=? WHERE id=?",
+              (front.strip(), back.strip(), tags, card_id))
+    conn.commit()
+    conn.close()
+ 
+ 
+def delete_card(card_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM flashcards WHERE id=?", (card_id,))
+    conn.commit()
+    conn.close()
+ 
+ 
+def review_card(card_id: int, correct: bool):
+    """
+    Cập nhật kết quả ôn tập theo thuật toán Spaced Repetition đơn giản:
+    - Đúng lần 1: ôn lại sau 1 ngày
+    - Đúng lần 2: ôn lại sau 3 ngày
+    - Đúng lần 3+: ôn lại sau 7 ngày
+    - Sai: ôn lại ngay hôm nay
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT review_count, correct FROM flashcards WHERE id=?", (card_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return
+ 
+    review_count, correct_count = row
+    review_count += 1
+    if correct:
+        correct_count += 1
+        # Spaced repetition intervals
+        intervals = [1, 3, 7, 14, 30]
+        idx = min(correct_count - 1, len(intervals) - 1)
+        next_review = (datetime.now() + timedelta(days=intervals[idx])).strftime("%Y-%m-%d %H:%M:%S")
+        difficulty = max(0, 3 - correct_count)
+    else:
+        next_review = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        difficulty = min(5, row[1] + 1) if row else 1
+ 
+    c.execute("""
+        UPDATE flashcards
+        SET review_count=?, correct=?, next_review=?, difficulty=?
+        WHERE id=?
+    """, (review_count, correct_count, next_review, difficulty, card_id))
+    conn.commit()
+    conn.close()
+ 
+ 
+def search_cards(keyword: str) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("""
+        SELECT f.*, d.name as deck_name FROM flashcards f
+        JOIN decks d ON f.deck_id = d.id
+        WHERE f.front LIKE ? OR f.back LIKE ? OR f.tags LIKE ?
+        ORDER BY f.created_at DESC
+    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"))
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
+ 
+ 
+def import_from_summary(deck_id: int, summary_text: str,
+                        source_file: str = "") -> int:
+    """
+    Tự động tạo flashcard từ kết quả tóm tắt:
+    Mỗi bullet point → 1 thẻ (front = từ khoá, back = câu đầy đủ)
+    """
+    count = 0
+    lines = [l.strip() for l in summary_text.split("\n") if l.strip()]
+    for line in lines:
+        line = line.lstrip("•- ").strip()
+        if len(line) < 10:
+            continue
+        # Front = 5 từ đầu + "..."
+        words = line.split()
+        front = " ".join(words[:6]) + "..." if len(words) > 6 else line
+        add_card(deck_id, front=front, back=line, source_file=source_file)
+        count += 1
+    return count
+ 
+ 
+# Khởi tạo DB khi import
+init_db()
