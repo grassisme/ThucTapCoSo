@@ -208,53 +208,53 @@ def add_flashcard(front, back, hint="", deck="General", scan_id=None):
 
 def auto_generate_flashcards(scan_id, results: dict, keywords: list):
     """
-    Tự động tạo flashcard từ kết quả scan:
-    1. Từ từ khoá KeyBERT → flashcard định nghĩa
-    2. Từ voting summary → flashcard câu hỏi nội dung
+    Tự động sinh flashcard / câu hỏi từ kết quả scan:
+      1. Rule-based QG: định nghĩa-trong-ngữ-cảnh + điền khuyết
+         (summarizer.generate_questions) — đáp án thực, không còn để rỗng.
+      2. Câu chủ đề mỗi đoạn (nếu có).
+      3. (Tùy chọn) Transformer-based QG qua Gemini nếu đặt biến môi trường
+         GEMINI_API_KEY — đúng nhánh "transformer-based" trong đề cương.
     """
     conn = get_conn()
     count = 0
 
     scan = get_scan(scan_id)
     deck = scan["file_name"] if scan else "Auto"
+    raw_text = results.get("raw_text", "")
 
-    # Từ khoá → flashcard
-    for kw in keywords[:10]:
-        front = f"What is '{kw}' in the context of this document?"
-        back  = f"Key term: {kw}\n\n(Refer to the document for full context)"
-        conn.execute("""
-            INSERT INTO flashcards (scan_id, front, back, deck)
-            VALUES (?, ?, ?, ?)
-        """, (scan_id, front, back, deck))
+    def _add(front, back, hint=""):
+        nonlocal count
+        conn.execute(
+            "INSERT INTO flashcards (scan_id, front, back, hint, deck) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (scan_id, front, back, hint, deck))
         count += 1
 
-    # Voting summary → flashcard câu hỏi
-    voting = results.get("voting", "")
-    if voting:
-        bullets = [b.strip().lstrip("•").strip()
-                   for b in voting.split("\n") if b.strip().startswith("•")]
-        for i, bullet in enumerate(bullets):
-            front = f"Key point #{i+1}: Complete this idea...\n\n{bullet[:40]}..."
-            back  = bullet
-            conn.execute("""
-                INSERT INTO flashcards (scan_id, front, back, deck)
-                VALUES (?, ?, ?, ?)
-            """, (scan_id, front, back, deck))
-            count += 1
+    # 1) Rule-based QG (định nghĩa-trong-ngữ-cảnh + điền khuyết)
+    try:
+        from summarizer import generate_questions
+        for q in generate_questions(raw_text, keywords[:12]):
+            _add(q["front"], q["back"], q.get("hint", ""))
+    except Exception as e:
+        print(f"[!] QG rule-based lỗi: {e}")
 
-    # Topic sentences → flashcard
+    # 2) Câu chủ đề mỗi đoạn (nếu pipeline có cung cấp 'topics')
     topics = results.get("topics", "")
     if topics:
         bullets = [b.strip().lstrip("•").strip()
                    for b in topics.split("\n") if b.strip().startswith("•")]
         for i, bullet in enumerate(bullets):
-            front = f"What is the main idea of paragraph {i+1}?"
-            back  = bullet
-            conn.execute("""
-                INSERT INTO flashcards (scan_id, front, back, deck)
-                VALUES (?, ?, ?, ?)
-            """, (scan_id, front, back, deck))
-            count += 1
+            _add(f"Ý chính của đoạn {i+1} là gì?", bullet)
+
+    # 3) (Tùy chọn) Transformer-based QG qua Gemini
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    if api_key:
+        try:
+            from summarizer import generate_questions_ai
+            for q in generate_questions_ai(raw_text, api_key):
+                _add(q["front"], q["back"], q.get("hint", ""))
+        except Exception as e:
+            print(f"[!] QG AI lỗi: {e}")
 
     conn.commit()
     conn.close()
@@ -292,6 +292,32 @@ def get_decks():
     """).fetchall()
     conn.close()
     return rows
+
+
+def rename_deck(old_name: str, new_name: str) -> int:
+    """Đổi tên bộ thẻ: cập nhật cột deck cho mọi flashcard thuộc bộ cũ.
+    Trả về số thẻ đã cập nhật. Nếu new_name trùng một bộ đang có,
+    các thẻ sẽ được gộp vào bộ đó (hành vi hợp lý, không mất dữ liệu)."""
+    new_name = (new_name or "").strip()
+    if not new_name or new_name == old_name:
+        return 0
+    conn = get_conn()
+    cur = conn.execute(
+        "UPDATE flashcards SET deck=? WHERE deck=?", (new_name, old_name))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
+
+
+def delete_deck(deck_name: str) -> int:
+    """Xoá toàn bộ flashcard thuộc một bộ thẻ. Trả về số thẻ đã xoá."""
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM flashcards WHERE deck=?", (deck_name,))
+    conn.commit()
+    n = cur.rowcount
+    conn.close()
+    return n
 
 
 def update_flashcard(fid, front, back, hint="", deck="General"):

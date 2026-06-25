@@ -108,7 +108,120 @@ class PaddleOCRScanner:
         return [{"text": t, "confidence": round(c, 4)} for t, c in parsed]
 
 
-def scan_image(path: str, scanner: PaddleOCRScanner) -> str:
+# ─── EASYOCR (đọc được dấu tiếng Việt) ───────────────────────────────────────
+class EasyOCRScanner:
+    """Engine EasyOCR — hỗ trợ tiếng Việt đầy đủ. Cài: pip install easyocr"""
+    _reader_cache = None   # (langs_tuple, reader)
+
+    def __init__(self, lang: str = "vi"):
+        self._langs = ["vi", "en"] if str(lang).lower().startswith("vi") else ["en"]
+
+    def _get_reader(self):
+        import easyocr
+        key = tuple(self._langs)
+        if (EasyOCRScanner._reader_cache is None
+                or EasyOCRScanner._reader_cache[0] != key):
+            print(f"[*] Đang load EasyOCR {self._langs} ...")
+            EasyOCRScanner._reader_cache = (key, easyocr.Reader(self._langs, gpu=False))
+            print("[✓] EasyOCR sẵn sàng")
+        return EasyOCRScanner._reader_cache[1]
+
+    def ocr_image(self, image_path: str) -> str:
+        reader = self._get_reader()
+        lines = reader.readtext(image_path, detail=0, paragraph=True)
+        return "\n".join(l for l in lines if l and str(l).strip())
+
+    def ocr_image_detail(self, image_path: str) -> list:
+        reader = self._get_reader()
+        rows = reader.readtext(image_path, detail=1, paragraph=False)
+        return [{"text": t, "confidence": round(float(c), 4)}
+                for _box, t, c in rows if t and str(t).strip()]
+
+
+# ─── TESSERACT (cần cài binary hệ thống + gói ngôn ngữ vie) ───────────────────
+class TesseractScanner:
+    """Engine Tesseract. Cài: pip install pytesseract  +  Tesseract-OCR (gói 'vie').
+    Nếu binary không nằm trong PATH, đặt biến môi trường TESSERACT_CMD trỏ tới
+    tesseract.exe (vd: C:\\Program Files\\Tesseract-OCR\\tesseract.exe)."""
+
+    def __init__(self, lang: str = "vie"):
+        self._lang = "vie+eng" if str(lang).lower().startswith("vi") else "eng"
+
+    @staticmethod
+    def _configure():
+        import pytesseract
+        cmd = os.environ.get("TESSERACT_CMD")
+        if cmd:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        return pytesseract
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            pt = TesseractScanner._configure()
+            pt.get_tesseract_version()
+            return True
+        except Exception:
+            return False
+
+    def ocr_image(self, image_path: str) -> str:
+        pt = self._configure()
+        from PIL import Image
+        return pt.image_to_string(Image.open(image_path), lang=self._lang).strip()
+
+    def ocr_image_detail(self, image_path: str) -> list:
+        txt = self.ocr_image(image_path)
+        return [{"text": l, "confidence": 1.0} for l in txt.splitlines() if l.strip()]
+
+
+# ─── FACTORY + SO SÁNH OCR ───────────────────────────────────────────────────
+def make_scanner(engine: str = "auto", lang: str = "vi"):
+    """Tạo scanner theo engine. 'auto': tiếng Việt -> EasyOCR, còn lại -> PaddleOCR."""
+    engine = (engine or "auto").lower()
+    if engine == "auto":
+        engine = "easyocr" if str(lang).lower().startswith("vi") else "paddle"
+    if engine == "easyocr":
+        return EasyOCRScanner(lang)
+    if engine == "tesseract":
+        return TesseractScanner(lang)
+    return PaddleOCRScanner(lang=lang)
+
+
+def _vi_diacritic_ratio(text: str) -> float:
+    """% ký tự mang dấu riêng của tiếng Việt / tổng số chữ cái — proxy chất lượng OCR VN."""
+    vi = ("ăâđêôơưĂÂĐÊÔƠƯáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩị"
+          "óòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ")
+    letters = [c for c in (text or "") if c.isalpha()]
+    if not letters:
+        return 0.0
+    return round(sum(1 for c in text if c in vi) / len(letters) * 100, 1)
+
+
+def compare_ocr(image_path: str, lang: str = "vi") -> list:
+    """Chạy nhiều engine OCR trên cùng một ảnh để so sánh (phục vụ đánh giá mục 1.3).
+    Trả về list dict: {engine, name, text, chars, vi_ratio, seconds, available, error}."""
+    import time
+    engines = [("paddle", "PaddleOCR"), ("easyocr", "EasyOCR"), ("tesseract", "Tesseract")]
+    out = []
+    for key, name in engines:
+        t0 = time.perf_counter()
+        text, err, avail = "", "", True
+        try:
+            text = make_scanner(key, lang).ocr_image(image_path) or ""
+        except ImportError as e:
+            err, avail = f"chưa cài ({e})", False
+        except Exception as e:
+            err, avail = str(e), False
+        out.append({
+            "engine": key, "name": name, "text": text, "chars": len(text),
+            "vi_ratio": _vi_diacritic_ratio(text),
+            "seconds": round(time.perf_counter() - t0, 2),
+            "available": avail, "error": err,
+        })
+    return out
+
+
+def scan_image(path: str, scanner) -> str:
     return scanner.ocr_image(path)
 
 
@@ -233,9 +346,19 @@ def scan_pptx(path: str, scanner: PaddleOCRScanner) -> str:
     return "\n\n".join(parts)
 
 
+def scan_txt(path: str) -> str:
+    for enc in ("utf-8", "utf-8-sig", "utf-16", "cp1258", "latin-1"):
+        try:
+            with open(path, encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return ""
+
+
 SUPPORTED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp",
-    ".pdf", ".docx", ".xlsx", ".xls", ".pptx",
+    ".pdf", ".docx", ".xlsx", ".xls", ".pptx", ".txt",
 }
 
 
@@ -251,21 +374,36 @@ def scan_file(path: str, scanner: PaddleOCRScanner) -> str:
         return scan_xlsx(path)
     elif ext == ".pptx":
         return scan_pptx(path, scanner)
+    elif ext == ".txt":
+        return scan_txt(path)
     else:
         print(f"[!] Không hỗ trợ: {ext} | Hỗ trợ: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
         return ""
 
 
-def quick_scan(file_path: str, lang: str = "vi") -> str:
+def quick_scan(file_path: str, lang: str = "vi", engine: str = "auto") -> str:
     """
     Dùng trong code:
         from Paddle_ocr_scanner import quick_scan
-        text = quick_scan(r"G:\\path\\to\\file.pdf")
-        print(text)
+        text = quick_scan(r"G:\\path\\to\\file.jpg", lang="vi", engine="auto")
+
+    engine: "auto" (vi -> EasyOCR, khác -> PaddleOCR) | "paddle" | "easyocr" | "tesseract".
+    Nếu engine chọn chưa cài, tự lùi về PaddleOCR và in hướng dẫn cài đặt.
     """
     check_dependencies()
-    scanner = PaddleOCRScanner(lang=lang)
-    return scan_file(file_path, scanner)
+    eng = (engine or "auto").lower()
+    if eng == "auto":
+        eng = "easyocr" if str(lang).lower().startswith("vi") else "paddle"
+    try:
+        return scan_file(file_path, make_scanner(eng, lang))
+    except ImportError as e:
+        print(f"[!] Engine '{eng}' chưa sẵn sàng ({e}).")
+        if eng == "easyocr":
+            print("    Cài: pip install easyocr")
+        elif eng == "tesseract":
+            print("    Cài: pip install pytesseract  +  Tesseract-OCR (gói ngôn ngữ 'vie')")
+        print("[!] Tạm dùng PaddleOCR (có thể rụng dấu tiếng Việt).")
+        return scan_file(file_path, PaddleOCRScanner(lang=lang))
 
 
 def main():

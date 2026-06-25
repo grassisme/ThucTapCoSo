@@ -22,6 +22,20 @@ def _ensure_nltk():
             nltk.download(pkg, quiet=True)
 
 
+# ─── B1: UNDERTHESEA — TÁCH TỪ TIẾNG VIỆT ────────────────────────────────────
+
+def segment_vi(text: str) -> str:
+    """Tách từ tiếng Việt bằng underthesea (cài: pip install underthesea)."""
+    try:
+        from underthesea import word_tokenize
+        return word_tokenize(text, format="text")
+    except ImportError:
+        return text
+    except Exception as e:
+        print(f"[!] underthesea lỗi: {e}")
+        return text
+
+
 # ─── LÀM SẠCH TEXT OCR ────────────────────────────────────────────────────────
 
 def clean_ocr_text(text: str) -> str:
@@ -89,43 +103,88 @@ def topic_sentence_summary(text: str, max_sentences: int = 3) -> str:
 
 # ─── KEYBERT: Trích xuất từ khoá quan trọng ───────────────────────────────────
 
-_keybert_model = None
+_keybert_models = {}   # cache theo tên model
 
-def _get_keybert():
-    """Lazy load KeyBERT (chỉ load 1 lần)."""
-    global _keybert_model
-    if _keybert_model is None:
+def _get_keybert(multilingual: bool = False):
+    """Lazy load KeyBERT. multilingual=True dùng model đa ngôn ngữ (cho tiếng Việt),
+    nếu tải lỗi sẽ tự lùi về model mặc định."""
+    name = ("paraphrase-multilingual-MiniLM-L12-v2" if multilingual
+            else "all-MiniLM-L6-v2")
+    if name not in _keybert_models:
         try:
             from keybert import KeyBERT
-            print("[*] Đang load KeyBERT model...")
-            _keybert_model = KeyBERT(model="all-MiniLM-L6-v2")
+            print(f"[*] Đang load KeyBERT model: {name} ...")
+            _keybert_models[name] = KeyBERT(model=name)
             print("[✓] KeyBERT sẵn sàng")
         except ImportError:
             print("[!] Cần cài: pip install keybert sentence-transformers")
-    return _keybert_model
+            _keybert_models[name] = None
+        except Exception as e:
+            print(f"[!] Không load được {name} ({e}); dùng model mặc định...")
+            if multilingual:
+                return _get_keybert(multilingual=False)
+            _keybert_models[name] = None
+    return _keybert_models[name]
 
 
-def extract_keywords(text: str, top_n: int = 10) -> list[str]:
+# Stopword tiếng Việt (hư từ) — lọc khỏi danh sách từ khoá
+_VI_STOPWORDS = {
+    "và","là","của","có","các","những","được","trên","trong","cho","với","để",
+    "khi","này","đó","một","người","không","đã","sẽ","đang","rằng","thì","mà",
+    "ở","ra","vào","lên","xuống","nên","cũng","vẫn","còn","nếu","vì","do","bởi",
+    "tại","theo","như","hay","hoặc","nhưng","tuy","tuy_nhiên","bị","rất","quá",
+    "lại","đến","từ","về","qua","sau","trước","giữa","cùng","nhau","kia","ấy",
+    "nào","gì","ai","sao","đâu","bao","nhiều","ít","mỗi","mọi","tất","tất_cả",
+    "cả","chỉ","thêm","nữa","đều","luôn","việc","cái","con","chiếc","sự","điều",
+    "thế","vậy","nó","họ","tôi","bạn","chúng","ta","anh","chị","em","ông","bà",
+    "đây","bằng","này","đó","một_số","khác",
+}
+
+
+def extract_keywords(text: str, top_n: int = 10, lang: str = "en") -> list[str]:
     """
-    Dùng KeyBERT trích xuất từ khoá quan trọng nhất.
-    Trả về list các từ khoá theo thứ tự quan trọng giảm dần.
+    Trích xuất từ khoá quan trọng bằng KeyBERT.
+    - lang="vi": tách từ bằng underthesea + lọc stopword tiếng Việt và dùng
+      model đa ngôn ngữ → từ khoá là cụm có nghĩa ("tìm kiếm") thay vì syllable lẻ.
+    - lang khác (mặc định "en"): dùng stopword tiếng Anh như cũ.
+    Trả về list từ khoá theo thứ tự quan trọng giảm dần.
     """
-    kb = _get_keybert()
+    is_vi = str(lang).lower().startswith("vi")
+    kb = _get_keybert(multilingual=is_vi)
     if not kb:
         return []
     try:
         cleaned = clean_ocr_text(text)
-        # keyphrase_ngram_range=(1,2): lấy cả unigram và bigram
-        # use_mmr=True: đảm bảo đa dạng từ khoá (không trùng lặp)
-        keywords = kb.extract_keywords(
-            cleaned,
-            keyphrase_ngram_range=(1, 2),
-            stop_words="english",
-            use_mmr=True,
+        if is_vi:
+            doc = segment_vi(cleaned)          # "tìm kiếm" -> "tìm_kiếm"
+            stop_words = list(_VI_STOPWORDS)
+        else:
+            doc = cleaned
+            stop_words = "english"
+
+        raw = kb.extract_keywords(
+            doc,
+            keyphrase_ngram_range=(1, 2),      # unigram + bigram
+            stop_words=stop_words,
+            use_mmr=True,                       # đa dạng, tránh trùng lặp
             diversity=0.5,
-            top_n=top_n,
+            top_n=top_n * 2 if is_vi else top_n,  # lấy dư để lọc bớt hư từ
         )
-        return [kw for kw, score in keywords]
+
+        out = []
+        for kw, _score in raw:
+            phrase = kw.replace("_", " ").strip()   # bỏ gạch nối của underthesea
+            toks = [t for t in re.split(r"[ _]+", phrase.lower()) if t]
+            if len(phrase) < 2:
+                continue
+            # bỏ cụm chỉ gồm toàn hư từ tiếng Việt
+            if toks and all(t in _VI_STOPWORDS for t in toks):
+                continue
+            if phrase not in out:
+                out.append(phrase)
+            if len(out) >= top_n:
+                break
+        return out
     except Exception as e:
         print(f"[!] KeyBERT lỗi: {e}")
         return []
@@ -146,6 +205,181 @@ def _score_sentence_by_keywords(sentence: str, keywords: list[str]) -> float:
         if kw.lower() in s:
             score += weight
     return score
+
+
+# ─── SINH CÂU HỎI TỰ ĐỘNG (Question Generation) ──────────────────────────────
+
+def _qg_split_sentences(text: str) -> list[str]:
+    """Tách câu sạch để sinh câu hỏi (bỏ bullet, câu quá ngắn, trùng lặp)."""
+    cleaned = clean_ocr_text(text)
+    raw = re.split(r'(?<=[.!?])\s+|\n+', cleaned)
+    sents = []
+    for s in raw:
+        s = s.strip().lstrip("•-*–").strip()
+        if len(s.split()) >= 4 and s not in sents:
+            sents.append(s)
+    return sents
+
+
+def _qg_find_context(keyword: str, sentences: list[str]) -> str:
+    """Tìm câu gốc đầu tiên chứa từ khoá (làm đáp án / câu khoét)."""
+    kw = keyword.lower()
+    for s in sentences:
+        if kw in s.lower():
+            return s
+    return ""
+
+
+def generate_questions(text: str, keywords: list, max_def: int = 6,
+                       max_cloze: int = 6) -> list[dict]:
+    """
+    Sinh câu hỏi RULE-BASED (template + ngữ pháp, Mitkov & Ha 2003):
+      - 'definition' : định nghĩa-trong-ngữ-cảnh — đáp án là câu gốc chứa từ khoá.
+      - 'cloze'      : điền khuyết — khoét từ khoá khỏi câu, đáp án là từ khoá.
+    Trả về list dict {qtype, front, back, hint}. Deterministic, không cần API.
+    """
+    sentences = _qg_split_sentences(text)
+    if not sentences:
+        return []
+
+    cards, used_cloze = [], set()
+
+    # 1) Định nghĩa trong ngữ cảnh — đáp án thực thay vì để rỗng
+    n_def = 0
+    for kw in keywords:
+        if n_def >= max_def:
+            break
+        ctx = _qg_find_context(kw, sentences)
+        if not ctx:
+            continue
+        cards.append({
+            "qtype": "definition",
+            "front": f"'{kw}' nghĩa là gì / liên quan gì trong tài liệu?",
+            "back":  ctx,
+            "hint":  "",
+        })
+        n_def += 1
+
+    # 2) Điền khuyết (cloze) — kỹ thuật QG kinh điển
+    n_cloze = 0
+    for kw in keywords:
+        if n_cloze >= max_cloze:
+            break
+        ctx = _qg_find_context(kw, sentences)
+        if not ctx or ctx in used_cloze:
+            continue
+        # Chỉ khoét khi từ khoá đứng độc lập (có ranh giới từ), tránh khoét
+        # nhầm bên trong một từ dài hơn (vd 'lp' trong 'help').
+        pattern = r"(?<!\w)" + re.escape(kw) + r"(?!\w)"
+        blank = re.sub(pattern, "_____", ctx, count=1, flags=re.IGNORECASE)
+        if blank == ctx:        # từ khoá không đứng độc lập -> bỏ
+            continue
+        used_cloze.add(ctx)
+        cards.append({
+            "qtype": "cloze",
+            "front": f"Điền vào chỗ trống:\n\n{blank}",
+            "back":  kw,
+            "hint":  f"{len(kw)} ký tự, bắt đầu bằng '{kw[:1].upper()}'",
+        })
+        n_cloze += 1
+
+    return cards
+
+
+def generate_questions_ai(text: str, api_key: str, language: str = "Vietnamese",
+                          n: int = 5) -> list[dict]:
+    """
+    Sinh câu hỏi TRANSFORMER-BASED qua Gemini (Lopez et al. 2021) — tùy chọn.
+    Trả về list dict {qtype:'ai', front, back, hint}. Không key/lỗi -> [].
+    """
+    if not api_key:
+        return []
+    prompt = (
+        f"Dựa vào đoạn văn dưới đây, hãy tạo {n} câu hỏi ôn tập bằng {language} "
+        f"kèm câu trả lời ngắn gọn. Mỗi câu hỏi nằm trên MỘT dòng, đúng định dạng:\n"
+        f"Q: <câu hỏi> || A: <câu trả lời>\n\n"
+        f"ĐOẠN VĂN:\n{clean_ocr_text(text)[:4000]}\n"
+    )
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        resp = client.models.generate_content(
+            model="gemini-2.0-flash", contents=prompt)
+        raw = resp.text or ""
+    except Exception as e:
+        print(f"[!] Gemini QG lỗi: {e}")
+        return []
+
+    cards = []
+    for line in raw.splitlines():
+        if "||" not in line or "Q:" not in line:
+            continue
+        q, _, a = line.partition("||")
+        q = q.split("Q:", 1)[-1].strip()
+        a = a.split("A:", 1)[-1].strip()
+        if q and a:
+            cards.append({"qtype": "ai", "front": q, "back": a, "hint": ""})
+    return cards
+
+
+# ─── B2: RAKE-NLTK — TRÍCH XUẤT TỪ KHOÁ ─────────────────────────────────────
+
+def rake_keywords(text: str, top_n: int = 10) -> list:
+    """Trích xuất từ khoá bằng RAKE-NLTK (cài: pip install rake-nltk)."""
+    try:
+        from rake_nltk import Rake
+        _ensure_nltk()
+        r = Rake()
+        r.extract_keywords_from_text(clean_ocr_text(text))
+        phrases = r.get_ranked_phrases()
+        return phrases[:top_n]
+    except ImportError:
+        print("[!] Cần cài: pip install rake-nltk")
+        return []
+    except Exception as e:
+        print(f"[!] RAKE lỗi: {e}")
+        return []
+
+
+# ─── B3: NETWORKX TEXTRANK ────────────────────────────────────────────────────
+
+def networkx_textrank_summary(text: str, num_sentences: int = 3) -> str:
+    """
+    TextRank thuần dựa trên NetworkX PageRank + TF-IDF cosine similarity.
+    Cài: pip install networkx scikit-learn numpy
+    """
+    _ensure_nltk()
+    cleaned = clean_ocr_text(text)
+    try:
+        import numpy as np
+        import networkx as nx
+        from sklearn.metrics.pairwise import cosine_similarity
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        sentences = re.split(r'(?<=[.!?])\s+', cleaned)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+
+        if len(sentences) < 2:
+            return "\n".join(f"• {s}" for s in sentences[:num_sentences])
+
+        vectorizer = TfidfVectorizer(stop_words="english")
+        tfidf_matrix = vectorizer.fit_transform(sentences)
+        sim_matrix = cosine_similarity(tfidf_matrix)
+        np.fill_diagonal(sim_matrix, 0)
+
+        graph = nx.from_numpy_array(sim_matrix)
+        scores = nx.pagerank(graph, max_iter=200)
+
+        ranked = sorted(scores.items(), key=lambda x: -x[1])[:num_sentences]
+        ranked_indices = sorted(i for i, _ in ranked)
+        return "\n".join(f"• {sentences[i]}" for i in ranked_indices)
+
+    except ImportError as e:
+        print(f"[!] NetworkX TextRank cần: pip install networkx scikit-learn numpy ({e})")
+        return textrank_summary(text, num_sentences)
+    except Exception as e:
+        print(f"[!] NetworkX TextRank lỗi: {e}")
+        return ""
 
 
 # ─── EXTRACTIVE: LSA + KeyBERT ────────────────────────────────────────────────
@@ -485,6 +719,96 @@ def voting_summary(text: str, num_sentences: int = 3) -> str:
     return "\n".join(f"• {s}" for s in ordered)
 
 
+# ─── SO SÁNH PHƯƠNG PHÁP TÓM TẮT (reference-free) ────────────────────────────
+
+def _summary_metrics(summary: str, original_chars: int, keywords: list):
+    """Chỉ số không cần bản tham chiếu: số câu, số ký tự, tỉ lệ nén, độ phủ từ khoá."""
+    content = " ".join(
+        l.strip().lstrip("•-*–").strip()
+        for l in (summary or "").splitlines() if l.strip())
+    sents = [s for s in re.split(r'(?<=[.!?])\s+', content) if s.strip()]
+    n_sent = len(sents)
+    n_char = len(content)
+    compress = round(n_char / original_chars * 100, 1) if original_chars else 0.0
+    coverage = 0.0
+    if keywords and content:
+        low = content.lower()
+        hit = sum(1 for k in keywords if str(k).lower() in low)
+        coverage = round(hit / len(keywords) * 100)
+    return n_sent, n_char, compress, coverage
+
+
+def compare_summaries(text: str, num_sentences: int = 3, api_key: str = "",
+                      lang: str = "en", keywords: list = None) -> list:
+    """
+    Chạy nhiều phương pháp tóm tắt trên cùng một văn bản và đo chỉ số so sánh.
+    Trả về list dict: {key, name, kind, summary, n_sent, n_char, compress,
+                       coverage, seconds, error}. Mỗi phương pháp bọc try/except.
+    """
+    cleaned = clean_ocr_text(text)
+    original_chars = len(cleaned)
+    if keywords is None:
+        try:
+            keywords = extract_keywords(text, top_n=12, lang=lang)
+        except Exception:
+            keywords = []
+
+    methods = [
+        ("networkx_textrank", "NetworkX TextRank", "extractive",
+            lambda t, n: networkx_textrank_summary(t, n)),
+        ("textrank", "TextRank (sumy)", "extractive",
+            lambda t, n: textrank_summary(t, n)),
+        ("lsa", "LSA", "extractive",
+            lambda t, n: lsa_summary(t, n)),
+        ("textteaser", "TextTeaser", "extractive",
+            lambda t, n: textteaser_summary(t, num_sentences=n)),
+        ("keybert", "KeyBERT", "extractive",
+            lambda t, n: keybert_summary(t, n)),
+        ("voting", "Voting Ensemble", "extractive",
+            lambda t, n: voting_summary(t, n)),
+    ]
+
+    results = []
+    for key, name, kind, fn in methods:
+        t0 = time.perf_counter()
+        try:
+            summ = fn(text, num_sentences) or ""
+            err = ""
+        except Exception as e:
+            summ, err = "", str(e)
+        secs = round(time.perf_counter() - t0, 2)
+        n_sent, n_char, compress, coverage = _summary_metrics(
+            summ, original_chars, keywords)
+        results.append({
+            "key": key, "name": name, "kind": kind, "summary": summ,
+            "n_sent": n_sent, "n_char": n_char, "compress": compress,
+            "coverage": coverage, "seconds": secs, "error": err,
+        })
+
+    # Gemini (abstractive) — chỉ chạy khi có API key
+    if api_key:
+        t0 = time.perf_counter()
+        language = "Vietnamese" if str(lang).lower().startswith("vi") else "English"
+        try:
+            summ = abstractive_summary(text, api_key, language) or ""
+            err = summ if summ.startswith("[!]") else ""
+            if err:
+                summ = ""
+        except Exception as e:
+            summ, err = "", str(e)
+        secs = round(time.perf_counter() - t0, 2)
+        n_sent, n_char, compress, coverage = _summary_metrics(
+            summ, original_chars, keywords)
+        results.append({
+            "key": "abstractive", "name": "Gemini (abstractive)",
+            "kind": "abstractive", "summary": summ, "n_sent": n_sent,
+            "n_char": n_char, "compress": compress, "coverage": coverage,
+            "seconds": secs, "error": err,
+        })
+
+    return results
+
+
 def summarize(
     text: str,
     api_key: str = "",
@@ -498,11 +822,18 @@ def summarize(
     keywords = extract_keywords(text, top_n=15)
     keywords_str = "\n".join(f"• {kw}" for kw in keywords) if keywords else "(không có)"
 
+    print("[*] Đang trích xuất từ khoá bằng RAKE...")
+    rake_kws = rake_keywords(text, top_n=10)
+    rake_str = "\n".join(f"• {kw}" for kw in rake_kws) if rake_kws else ""
+
     print("[*] Đang chạy LSA + KeyBERT rerank...")
     lsa = lsa_summary(text, num_sentences)
 
     print("[*] Đang chạy TextRank + KeyBERT rerank...")
     tr = textrank_summary(text, num_sentences)
+
+    print("[*] Đang chạy NetworkX TextRank...")
+    nx_tr = networkx_textrank_summary(text, num_sentences)
 
     print("[*] Đang chạy KeyBERT thuần...")
     kb = keybert_summary(text, num_sentences)
@@ -521,14 +852,16 @@ def summarize(
         print("[!] Không có API key → bỏ qua Gemini")
 
     return {
-        "topics":    topics,
-        "keywords":  keywords_str,   # ← từ khoá KeyBERT trích xuất
-        "keybert":   kb,             # ← tóm tắt thuần KeyBERT
-        "lsa":       lsa,            # ← LSA + KeyBERT rerank
-        "textrank":  tr,             # ← TextRank + KeyBERT rerank
-        "textteaser":tt,
-        "voting":    voting,         # ← tất cả + KeyBERT, tốt nhất
-        "abstractive": abs_result,
+        "topics":            topics,
+        "keywords":          keywords_str,
+        "rake_keywords":     rake_str,
+        "keybert":           kb,
+        "lsa":               lsa,
+        "textrank":          tr,
+        "networkx_textrank": nx_tr,
+        "textteaser":        tt,
+        "voting":            voting,
+        "abstractive":       abs_result,
     }
 
 
