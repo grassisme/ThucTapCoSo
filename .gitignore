@@ -1,0 +1,5 @@
+# File tạm/khoá của Word
+~$*
+
+# Báo cáo cuối: chỉ đẩy bản PDF lên repo, giữ .docx để chỉnh sửa ở local
+Document/FinalReport/*.docx
